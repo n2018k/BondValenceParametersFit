@@ -333,6 +333,33 @@ class BVParamSolver:
         os.makedirs(f'{save_dir}/R0Bs/{algo}', exist_ok=True)
         os.makedirs(f'{save_dir}/no_solu', exist_ok=True)
 
+    def _is_physically_valid(self, R0, B, min_B, eps_R0_ge_B):
+        if R0 is None or B is None:
+            return False
+        return (B >= min_B) and (R0 >= (B + eps_R0_ge_B))
+
+    def _fit_once(self, eqs_list_sympy, R0_bounds, B_bounds):
+        optimizers = {
+            'brute': lambda: brute(self.objective, [R0_bounds, B_bounds], args=(eqs_list_sympy,)),
+            'shgo': lambda: shgo(self.objective, [R0_bounds, B_bounds], args=(eqs_list_sympy,)).x,
+            'diff': lambda: differential_evolution(self.objective, [R0_bounds, B_bounds], args=(eqs_list_sympy,)).x,
+            'dual_annealing': lambda: dual_annealing(self.objective, [R0_bounds, B_bounds], args=(eqs_list_sympy,)).x,
+            'direct': lambda: direct(self.objective, [R0_bounds, B_bounds], args=(eqs_list_sympy,)).x
+        }
+
+        algo = self.algo.lower()
+        if algo not in optimizers:
+            valid_algos = list(optimizers.keys())
+            print(
+                f"Warning: Invalid algorithm '{algo}'. Must be one of: {', '.join(valid_algos)}. Using default SHGO optimizer."
+            )
+            algo = 'shgo'
+
+        result = optimizers[algo]()
+        if isinstance(result, (list, tuple, np.ndarray)) and len(result) >= 2:
+            return float(result[0]), float(result[1])
+        return None, None
+
     def objective(self, variables, eqs):
         """
         Objective function for optimization - mean squared error
@@ -395,7 +422,15 @@ class BVParamSolver:
         return eqs_list, (bmin, bmax)
 
     def solve_R0Bs(self, cation, anion, bond_type_list, networkValence_dict,
-                  bondLen_dict, materID, chem_formula, R0_bounds):
+                  bondLen_dict, materID, chem_formula, R0_bounds,
+                  *,
+                  enforce_constraints: bool = False,
+                  allow_sij_tweaks: bool = False,
+                  min_B: float = 0.05,
+                  eps_R0_ge_B: float = 0.1,
+                  sij_step_frac: float = 0.05,
+                  sij_max_frac: float = 0.20,
+                  record_fit_log: bool = False):
         """
         Optimize R0 and B parameters
         
@@ -412,34 +447,124 @@ class BVParamSolver:
         Returns:
             tuple: Optimized (R0, B) values
         """
-        eqs_list_math, B_bounds = self.get_eqs_for_R0B(cation, anion, bond_type_list,
-                                                      networkValence_dict, bondLen_dict,
-                                                      materID, chem_formula, R0_bounds)
-        if not eqs_list_math:
-            return []
-            
-        eqs_list_sympy = [sp.sympify(eq) for eq in eqs_list_math]
-        
-        # Select optimization algorithm
-        optimizers = {
-            'brute': lambda: brute(self.objective, [R0_bounds, B_bounds], args=(eqs_list_sympy,)),
-            'shgo': lambda: shgo(self.objective, [R0_bounds, B_bounds], args=(eqs_list_sympy,)).x,
-            'diff': lambda: differential_evolution(self.objective, [R0_bounds, B_bounds], args=(eqs_list_sympy,)).x,
-            'dual_annealing': lambda: dual_annealing(self.objective, [R0_bounds, B_bounds], args=(eqs_list_sympy,)).x,
-            'direct': lambda: direct(self.objective, [R0_bounds, B_bounds], args=(eqs_list_sympy,)).x
-        }
-        
-        # Validate and normalize algorithm selection
-        algo = self.algo.lower()
-        if algo not in optimizers:
-            valid_algos = list(optimizers.keys())
-            if algo not in valid_algos:
-                print(f"Warning: Invalid algorithm '{algo}'. Must be one of: {', '.join(valid_algos)}. Using default SHGO optimizer.")
-                algo = 'shgo'
-        
-        # Run optimization with selected algorithm
-        optimizer = optimizers[algo]
-        result = optimizer()
-        
-        # Ensure consistent return type (tuple)
-        return tuple(result) if isinstance(result, (list, np.ndarray)) else result
+        fit_log = []
+
+        if allow_sij_tweaks and not enforce_constraints:
+            # Sij tweaks are only meaningful when constraint checks are enabled.
+            enforce_constraints = True
+
+        # Determine target bonds and their lengths up-front (used for shortest-bond selection).
+        target_bonds = [
+            e for e in bond_type_list
+            if re.split(r'\d+', e)[0] == cation and re.split(r'\d+', e)[1] == anion
+        ]
+        if not target_bonds:
+            self.no_sol.append((materID, cation, anion, chem_formula, 'no_eqs_from_graph'))
+            return ([], fit_log) if record_fit_log else []
+
+        target_bonds_sorted = sorted(target_bonds, key=lambda b: bondLen_dict.get(b, np.inf))
+        shortest_bond = target_bonds_sorted[0]
+
+        if not enforce_constraints:
+            eqs_list_math, B_bounds = self.get_eqs_for_R0B(
+                cation, anion, bond_type_list,
+                networkValence_dict, bondLen_dict,
+                materID, chem_formula, R0_bounds
+            )
+            if not eqs_list_math:
+                return ([], fit_log) if record_fit_log else []
+
+            if not B_bounds:
+                B_bounds = (-5.0, 5.0)
+
+            eqs_list_sympy = [sp.sympify(eq) for eq in eqs_list_math]
+            R0, B = self._fit_once(eqs_list_sympy, R0_bounds, B_bounds)
+            if R0 is None or B is None:
+                return ([], fit_log) if record_fit_log else []
+
+            if record_fit_log:
+                fit_log.append(
+                    {
+                        "strategy": "legacy",
+                        "enforce_constraints": False,
+                        "allow_sij_tweaks": False,
+                        "R0": R0,
+                        "B": B,
+                        "sse": float(self.objective([R0, B], eqs_list_sympy)),
+                        "num_eqs": len(eqs_list_sympy),
+                    }
+                )
+            solution = (R0, B)
+            return (solution, fit_log) if record_fit_log else solution
+
+        def attempt_fit(network_valence_override, sij_tweak_frac):
+            eqs_list_math, B_bounds = self.get_eqs_for_R0B(
+                cation, anion, bond_type_list,
+                network_valence_override, bondLen_dict,
+                materID, chem_formula, R0_bounds
+            )
+            if not eqs_list_math or not B_bounds:
+                return None
+
+            bmin, bmax = float(B_bounds[0]), float(B_bounds[1])
+            if not np.isfinite(bmin) or not np.isfinite(bmax) or (bmax <= bmin):
+                bmin, bmax = min_B, max(min_B + 5.0, 5.0)
+
+            bmin = max(bmin, min_B)
+            if bmax <= bmin:
+                bmax = bmin + 5.0
+
+            eqs_list_sympy = [sp.sympify(eq) for eq in eqs_list_math]
+            R0, B = self._fit_once(eqs_list_sympy, R0_bounds, (bmin, bmax))
+            if R0 is None or B is None:
+                return None
+            sse = float(self.objective([R0, B], eqs_list_sympy))
+            is_valid = self._is_physically_valid(R0, B, min_B=min_B, eps_R0_ge_B=eps_R0_ge_B)
+            return {
+                "strategy": "constrained",
+                "enforce_constraints": True,
+                "allow_sij_tweaks": bool(allow_sij_tweaks),
+                "sij_tweak_frac": sij_tweak_frac,
+                "shortest_bond": shortest_bond,
+                "shortest_bond_len": float(bondLen_dict.get(shortest_bond, np.nan)),
+                "shortest_bond_sij": float(network_valence_override.get(shortest_bond, np.nan)),
+                "R0": R0,
+                "B": B,
+                "sse": sse,
+                "num_eqs": len(eqs_list_sympy),
+                "valid": is_valid,
+            }
+
+        # Attempt 0: no tweak.
+        base_attempt = attempt_fit(networkValence_dict, sij_tweak_frac=0.0)
+        if base_attempt:
+            fit_log.append(base_attempt)
+            if base_attempt["valid"]:
+                solution = (base_attempt["R0"], base_attempt["B"])
+                return (solution, fit_log) if record_fit_log else solution
+
+        if not allow_sij_tweaks:
+            self.no_sol.append((materID, cation, anion, chem_formula, 'constraint_unsatisfied'))
+            return ([], fit_log) if record_fit_log else []
+
+        # Retry with increasing Sij on the shortest bond: +5%, +10%, +15%, +20%.
+        base_sij = networkValence_dict.get(shortest_bond, None)
+        if base_sij is None or base_sij <= 0:
+            self.no_sol.append((materID, cation, anion, chem_formula, 'negative_Sij'))
+            return ([], fit_log) if record_fit_log else []
+
+        max_steps = int(round(sij_max_frac / sij_step_frac))
+        for step_idx in range(1, max_steps + 1):
+            tweak_frac = min(step_idx * sij_step_frac, sij_max_frac)
+            tweaked = dict(networkValence_dict)
+            tweaked[shortest_bond] = float(base_sij) * (1.0 + tweak_frac)
+
+            cur_attempt = attempt_fit(tweaked, sij_tweak_frac=tweak_frac)
+            if cur_attempt:
+                fit_log.append(cur_attempt)
+                if cur_attempt["valid"]:
+                    solution = (cur_attempt["R0"], cur_attempt["B"])
+                    return (solution, fit_log) if record_fit_log else solution
+
+        self.no_sol.append((materID, cation, anion, chem_formula, 'constraint_unsatisfied_after_sij_tweaks'))
+        return ([], fit_log) if record_fit_log else []
